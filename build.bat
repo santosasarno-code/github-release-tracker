@@ -1,79 +1,104 @@
 @echo off
-setlocal EnableExtensions
+setlocal
 cd /d "%~dp0"
-echo ==============================================
-echo  GitHub Release Tracker (Rust) - build
-echo ==============================================
+title Build GitHub Release Tracker
 
-where cargo >nul 2>nul
+echo ============================================================
+echo  GitHub Release Tracker - build the portable .exe
+echo ============================================================
+echo.
+
+rem --- 1. Python ---------------------------------------------------------
+where py >nul 2>&1
+if %errorlevel%==0 (set "PY=py -3") else (set "PY=python")
+%PY% --version
 if errorlevel 1 (
-    echo.
-    echo [X] Rust is not installed ^(cargo not found^).
-    echo     1. Install Rust from https://rustup.rs  ^(choose the default "MSVC" option^)
-    echo     2. Install "Build Tools for Visual Studio" with the workload
-    echo        "Desktop development with C++"  ^(it includes the Windows SDK^)
-    echo     3. Open a NEW window and run this file again.
-    goto :fail
+  echo.
+  echo [X] Python was not found. Install Python 3.10 or newer from python.org
+  echo     and tick "Add python.exe to PATH" in the installer.
+  goto :fail
 )
 
-rem --- version = the one in Cargo.toml (the only line that starts with: version = ) ---
+rem --- 2. tkinter (the app's window toolkit) -------------------------------
+%PY% -c "import tkinter" >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo [X] This Python has no tkinter. Run the Python installer again, choose
+  echo     Modify, and tick "tcl/tk and IDLE".
+  goto :fail
+)
+
+rem --- 3. The version number in the source ---------------------------------
 set "VER="
-for /f "tokens=2 delims==" %%A in ('findstr /b /c:"version = " Cargo.toml') do if not defined VER set "VER=%%A"
-set "VER=%VER: =%"
-set "VER=%VER:"=%"
-echo %VER%| findstr /r /c:"^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul
-if errorlevel 1 (
-    echo [X] Could not read a version like 2.0.0 from Cargo.toml ^(got "%VER%"^).
-    goto :fail
+for /f "usebackq delims=" %%V in (`%PY% tools\release_info.py version`) do set "VER=%%V"
+if not defined VER (
+  echo.
+  echo [X] Could not read APP_VERSION from github_release_tracker.py ^(see the message above^).
+  goto :fail
 )
-echo Version: %VER%   ^(the Git tag / release must be v%VER%^)
+echo App version in the source: %VER%  ^(release tag will be v%VER%^)
 echo.
 
-echo [1/3] Running the logic tests ...
-cargo test --lib --locked --quiet
+rem --- 4. The source must at least compile --------------------------------
+%PY% -m py_compile github_release_tracker.py
 if errorlevel 1 (
-    echo [X] Tests failed. Not building.
-    goto :fail
+  echo.
+  echo [X] github_release_tracker.py has an error. Fix it and run this again.
+  goto :fail
+)
+
+rem --- 5. PyInstaller ----------------------------------------------------
+echo Installing / updating PyInstaller ^(needs internet^)...
+%PY% -m pip install --upgrade pyinstaller
+if errorlevel 1 (
+  echo.
+  echo [X] Could not install PyInstaller. Check your internet connection.
+  goto :fail
+)
+
+rem --- 6. Build ----------------------------------------------------------
+set "ICON="
+if exist icon.ico (set "ICON=--icon icon.ico") else (echo [!] icon.ico not found - building without the app icon.)
+echo.
+echo Building GitHubReleaseTracker.exe ^(single file, no console window^)...
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed %ICON% --name GitHubReleaseTracker github_release_tracker.py
+if errorlevel 1 (
+  echo.
+  echo [X] Build failed. See the messages above.
+  goto :fail
+)
+if not exist dist\GitHubReleaseTracker.exe (
+  echo.
+  echo [X] The build finished but dist\GitHubReleaseTracker.exe is missing.
+  goto :fail
+)
+
+rem --- 7. Release notes with the SHA-256 -----------------------------------
+echo.
+%PY% tools\release_info.py notes dist\GitHubReleaseTracker.exe
+if errorlevel 1 (
+  echo.
+  echo [!] The exe was built, but the release notes file could not be written.
 )
 
 echo.
-echo [2/3] Building the exe ^(the first build downloads and compiles a few crates, 1-3 minutes^) ...
-cargo build --release --locked
-if errorlevel 1 (
-    echo.
-    echo [X] Build failed. Common causes:
-    echo     - "linker `link.exe` not found"  -^> install Build Tools for Visual Studio, workload "Desktop development with C++"
-    echo     - "rc.exe" / "RC.EXE not found"   -^> same workload, make sure a Windows 10/11 SDK is ticked
-    echo     - no internet while downloading crates
-    goto :fail
-)
-
+echo ============================================================
+echo  DONE: version %VER%
+echo ============================================================
+echo  Your portable app:   %~dp0dist\GitHubReleaseTracker.exe
+echo  Release notes text:  %~dp0dist\release-notes-v%VER%.md
 echo.
-echo [3/3] Collecting the result ...
-if not exist dist mkdir dist
-copy /y "target\release\github-release-tracker.exe" "dist\GitHubReleaseTracker.exe" >nul
-if errorlevel 1 (
-    echo [X] Could not copy the exe.
-    goto :fail
-)
-powershell -NoProfile -ExecutionPolicy Bypass -File "tools\release-notes.ps1" -Version "%VER%" -Exe "dist\GitHubReleaseTracker.exe" -Out "dist\release-notes-v%VER%.md"
-if errorlevel 1 (
-    echo [X] Could not write the release notes / hash.
-    goto :fail
-)
-
+echo  Next ^(details in RELEASING.md^):
+echo    1. Run the exe once and check the title says v%VER%.
+echo    2. Upload the changed files to GitHub.
+echo    3. Create a release with the tag  v%VER%  ^(exactly this^), attach the exe,
+echo       and paste the release notes text into the description.
 echo.
-echo ==============================================
-echo  DONE
-echo   dist\GitHubReleaseTracker.exe
-echo   dist\GitHubReleaseTracker.exe.sha256
-echo   dist\release-notes-v%VER%.md   ^(paste into the GitHub release^)
-echo ==============================================
-for %%F in ("dist\GitHubReleaseTracker.exe") do echo  Size: %%~zF bytes
-if not defined CI pause
+pause
 exit /b 0
 
 :fail
 echo.
-if not defined CI pause
+echo Build stopped.
+pause
 exit /b 1

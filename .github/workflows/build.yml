@@ -1,10 +1,17 @@
 name: Build Windows exe
 
-# Manual only: Actions tab -> "Build Windows exe" -> Run workflow.
-# It only builds and uploads an artifact; it never touches your Releases.
+# MANUAL ONLY. This workflow never runs by itself and never touches a Release: publishing a release
+# or pushing a tag does nothing here. You start it, download the result, and attach it to the Release
+# yourself (RELEASING.md). Building on GitHub's own Windows runner means the public run log shows
+# exactly how the exe was made. Start it like this:
+#   Actions tab -> "Build Windows exe" -> Run workflow
+#   -> the exe, its checksum and ready-to-paste release notes are kept as a downloadable build
+#      artifact (they are NOT attached to a Release: you do that by hand, see RELEASING.md).
+
 on:
   workflow_dispatch:
 
+# Least privilege: the build can only read the repository.
 permissions:
   contents: read
 
@@ -12,28 +19,42 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Rust toolchain
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check that Python has tkinter and the source compiles
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustc --version
-          cargo --version
-      - name: Test the logic
-        run: cargo test --lib --locked
-      - name: Build
-        run: cargo build --release --locked
-      - name: Collect, hash and check
-        shell: pwsh
+          python -c "import tkinter; print('tkinter OK, Tk', tkinter.TkVersion)"
+          python -m py_compile github_release_tracker.py
+
+      - name: Install PyInstaller
+        run: python -m pip install "pyinstaller>=6,<7"
+
+      - name: Build the exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --icon icon.ico --name GitHubReleaseTracker github_release_tracker.py
+
+      - name: Check the exe exists, then write its SHA-256 checksum
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/github-release-tracker.exe dist/GitHubReleaseTracker.exe
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          & tools/release-notes.ps1 -Version $v -Exe dist/GitHubReleaseTracker.exe -Out "dist/release-notes-v$v.md"
-          $size = (Get-Item dist/GitHubReleaseTracker.exe).Length
-          Write-Host "Version $v, exe size $size bytes"
-          if ($size -lt 100000) { throw "exe is suspiciously small" }
-      - uses: actions/upload-artifact@v4
+          $exe = "dist/GitHubReleaseTracker.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 1MB) { throw "Exe is suspiciously small ($size bytes)" }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist/GitHubReleaseTracker.exe.sha256" -Value "$hash  GitHubReleaseTracker.exe" -Encoding ascii
+          Write-Host "SHA-256: $hash  ($size bytes)"
+
+      - name: Write the release notes (hash, changelog, link to this run)
+        run: python tools/release_info.py notes dist/GitHubReleaseTracker.exe --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Keep the exe, checksum and release notes as a build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: GitHubReleaseTracker-windows
           path: |

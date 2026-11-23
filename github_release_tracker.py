@@ -51,12 +51,12 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
 API = "https://api.github.com"
-MAX_PROJECTS = 500
+MAX_PROJECTS = 2000
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_CUSTOM_NAME = 80
 
@@ -779,9 +779,33 @@ def release_page(p):
 
 
 def repo_label(p):
-    """What the Repository column shows: owner/repo, with the host in front for other hosts."""
+    """The full address (host first for other servers); used by the search box."""
     full = "%s/%s" % (p["owner"], p["repo"])
     return "%s/%s" % (host_label(p["host"]), full) if p.get("host") else full
+
+
+def repo_path(p):
+    """What the Repository column shows: owner/repo (the host is in the Source column)."""
+    return "%s/%s" % (p["owner"], p["repo"])
+
+
+# Known hosts get a friendly name in the Source column; any other server shows its own address.
+SOURCE_NAMES = {"github.com": "GitHub", "gitlab.com": "GitLab", "codeberg.org": "Codeberg"}
+_SOURCE_ORDER = ("GitHub", "GitLab", "Codeberg")
+
+
+def source_label(p):
+    """Where the project lives: GitHub, GitLab, Codeberg, or the server's address."""
+    host = p.get("host")
+    if not host:
+        return "GitHub"
+    shown = host_label(host)
+    return SOURCE_NAMES.get(shown.lower(), shown)
+
+
+def _source_key(p):
+    name = source_label(p)
+    return (_SOURCE_ORDER.index(name) if name in _SOURCE_ORDER else len(_SOURCE_ORDER), name.casefold())
 
 
 def _id_value(value):
@@ -919,7 +943,7 @@ def build_export(projects):
     }
 
 
-SORTABLE = ("name", "repo", "published", "status")  # columns whose header can be clicked
+SORTABLE = ("name", "repo", "source", "published", "status")  # columns whose header can be clicked
 
 
 def _title_key(p):
@@ -950,7 +974,13 @@ def sort_projects(projects, col, asc):
     if col == "name":
         return sorted(projects, key=lambda p: (_title_key(p), project_key(p)), reverse=not asc)
     if col == "repo":
-        return sorted(projects, key=project_key, reverse=not asc)
+        # what the column shows (owner/repo); the full key only breaks ties
+        return sorted(projects, key=lambda p: (repo_path(p).lower(), project_key(p)), reverse=not asc)
+    if col == "source":
+        # GitHub, GitLab, Codeberg, then other servers A-Z. Same source: A-Z by name in either
+        # direction (the second sort is stable, so the name order is kept).
+        by_name = sorted(projects, key=lambda p: (_title_key(p), project_key(p)))
+        return sorted(by_name, key=_source_key, reverse=not asc)
     if col == "published":
         dated = [p for p in projects if (p.get("latest") or {}).get("published_at")]
         undated = [p for p in projects if not (p.get("latest") or {}).get("published_at")]
@@ -1025,6 +1055,42 @@ def status_text(p):
         new = latest.get("tag") or latest.get("name") or "new release"
         return "Update available: %s -> %s" % (old, new) if old else "Update available: " + new
     return "Up to date"
+
+
+def status_kind(p):
+    """'error', 'update', 'none' (no releases) or 'ok': the same split that colors the rows."""
+    if p.get("error"):
+        return "error"
+    if has_update(p):
+        return "update"
+    if not p.get("latest"):
+        return "none"
+    return "ok"
+
+
+# Choices of the status filter (value, menu text). "all" shows everything.
+STATUS_FILTERS = [("all", "All projects"), ("update", "Updates available"), ("error", "Errors"),
+                  ("ok", "Up to date"), ("none", "No releases")]
+
+
+def filter_projects(projects, query="", kind="all"):
+    """The projects that match the search text and the status filter, in the same order.
+
+    Every word of the search text must appear (any case) in the project name or in the
+    repository address, so "emu rom" finds "Emu Roms" and "owner/emu-roms". Nothing is
+    changed; this only decides what is shown.
+    """
+    terms = (query or "").casefold().split()
+    out = []
+    for p in projects:
+        if kind != "all" and status_kind(p) != kind:
+            continue
+        if terms:
+            hay = ("%s %s %s" % (display_name(p), repo_label(p), source_label(p))).casefold()
+            if not all(t in hay for t in terms):
+                continue
+        out.append(p)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1219,13 +1285,39 @@ class App(tk.Tk):
         self._button(bar, "Export", "export", self.export_json).pack(side="right", padx=(0, 8))
         self._button(bar, "Import", "import", self.import_json).pack(side="right", padx=(0, 8))
 
+        # Search + status filter: only changes what is listed, never the saved data.
+        flt = ttk.Frame(self, padding=(10, 0, 10, 6))
+        flt.pack(fill="x")
+        ttk.Label(flt, text="Filter:").pack(side="left")
+        self.filter_text = tk.StringVar()
+        self.filter_kind = tk.StringVar(value="all")
+        self.filter_entry = ttk.Entry(flt, textvariable=self.filter_text)
+        self.filter_entry.pack(side="left", fill="x", expand=True, padx=8)
+        self.filter_entry.bind("<Escape>", lambda e: self.clear_filter())
+        self.filter_text.trace_add("write", lambda *a: self._schedule_filter())
+        self.kind_label = tk.StringVar(value="Show: All projects")
+        self.kind_button = ttk.Menubutton(flt, textvariable=self.kind_label, width=24)
+        self.kind_menu = tk.Menu(self.kind_button, tearoff=0)
+        for value, text in STATUS_FILTERS:
+            self.kind_menu.add_radiobutton(label=text, value=value, variable=self.filter_kind,
+                                           command=self._kind_changed)
+        self.kind_button["menu"] = self.kind_menu
+        self.kind_button.pack(side="left")
+        self.btn_clear = ttk.Button(flt, text="Clear", command=self.clear_filter)
+        self.btn_clear.pack(side="left", padx=(8, 0))
+        self.count_var = tk.StringVar()
+        ttk.Label(flt, textvariable=self.count_var, style="Sub.TLabel", width=14, anchor="e").pack(side="left", padx=(8, 0))
+        self.bind("<Control-f>", lambda e: self._focus_filter())
+        self.bind("<Control-F>", lambda e: self._focus_filter())
+
         frame = ttk.Frame(self, padding=(10, 0, 10, 0))
         frame.pack(fill="both", expand=True)
-        cols = ("name", "repo", "release", "published", "status", "checked")
+        cols = ("name", "repo", "source", "release", "published", "status", "checked")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         heads = [
             ("name", "Project", 230, 120),
-            ("repo", "Repository", 280, 120),
+            ("repo", "Repository", 250, 120),
+            ("source", "Source", 125, 95),         # wide enough for the sort arrow
             ("release", "Current release", 150, 90),
             ("published", "Published", 125, 115),  # wide enough for the sort arrow
             ("status", "Status", 260, 120),
@@ -1258,6 +1350,8 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self._popup)
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<F2>", lambda e: self.rename_selected())
+        self.tree.bind("<Control-a>", lambda e: self._select_all_rows())
+        self.tree.bind("<Control-A>", lambda e: self._select_all_rows())
         self.tree.bind("<Button-1>", self._on_tree_click, add="+")
         self.tree.bind("<Configure>", lambda e: self._schedule_lines(delay=40), add="+")
         self.tree.bind("<Configure>", self._layout_columns, add="+")
@@ -1325,6 +1419,9 @@ class App(tk.Tk):
               foreground=[("disabled", c["sub_fg"])])
         s.configure("TEntry", fieldbackground=c["field"], foreground=c["fg"], insertcolor=c["fg"],
                     bordercolor=c["border"], lightcolor=c["field"], darkcolor=c["field"])
+        s.configure("TMenubutton", background=c["btn_bg"], foreground=c["fg"], bordercolor=c["border"],
+                    lightcolor=c["btn_bg"], darkcolor=c["btn_bg"], arrowcolor=c["fg"], padding=(8, 4))
+        s.map("TMenubutton", background=[("active", c["btn_active"])])
         s.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["fg"],
@@ -1341,7 +1438,7 @@ class App(tk.Tk):
         self.tree.tag_configure("update", background=c["update_bg"], foreground=c["update_fg"])
         self.tree.tag_configure("error", foreground=c["error_fg"])
         self.tree.tag_configure("none", foreground=c["none_fg"])
-        for mnu in (self.menu, self.edit_menu, self.status_menu):
+        for mnu in (self.menu, self.edit_menu, self.status_menu, self.kind_menu):
             mnu.configure(bg=c["field"], fg=c["fg"], activebackground=c["sel_bg"],
                           activeforeground=c["sel_fg"], disabledforeground=c["none_fg"], bd=0)
         self.refresh_icons()
@@ -1724,6 +1821,7 @@ class App(tk.Tk):
         self.status_menu = tk.Menu(self, tearoff=0)
         self.status_menu.add_command(label="Copy", command=self.copy_status)
         self.attach_edit_menu(self.entry)
+        self.attach_edit_menu(self.filter_entry)
         self.status_label.bind("<Button-3>", self._show_status_menu)
 
     def attach_edit_menu(self, entry, masked=False):
@@ -1854,6 +1952,44 @@ class App(tk.Tk):
         self.update_headings()
         self.render()
 
+    # ---- search / filter ---------------------------------------------------
+    def _schedule_filter(self):
+        """Re-list shortly after the last keystroke (400+ rows are rebuilt each time)."""
+        if getattr(self, "_filter_job", None):
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(150, self._apply_filter)
+
+    def _apply_filter(self):
+        self._filter_job = None
+        self.render()
+
+    def _kind_changed(self):
+        text = dict(STATUS_FILTERS)[self.filter_kind.get()]
+        self.kind_label.set("Show: " + text)
+        self.render()
+
+    def clear_filter(self):
+        self.filter_text.set("")
+        self.filter_kind.set("all")
+        self.kind_label.set("Show: " + dict(STATUS_FILTERS)["all"])
+        if getattr(self, "_filter_job", None):
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
+        self.render()
+
+    def _focus_filter(self):
+        self.filter_entry.focus_set()
+        self.filter_entry.selection_range(0, "end")
+        return "break"
+
+    def _select_all_rows(self):
+        """Ctrl+A in the list: select every project that is listed (a filter limits it)."""
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
+
+    def filter_active(self):
+        return bool(self.filter_text.get().strip()) or self.filter_kind.get() != "all"
+
     # ---- rendering -------------------------------------------------------
     def render(self):
         self._close_editor(True)  # rows are rebuilt below: save a name being typed first
@@ -1865,7 +2001,11 @@ class App(tk.Tk):
         self.after_idle(self._allow_select)
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
-        projects = sort_projects(self.data["projects"], self.sort_col, self.sort_asc)
+        total = len(self.data["projects"])
+        projects = sort_projects(filter_projects(self.data["projects"], self.filter_text.get(),
+                                                 self.filter_kind.get()), self.sort_col, self.sort_asc)
+        self.count_var.set("%d of %d" % (len(projects), total) if len(projects) != total
+                           else "%d project%s" % (total, "" if total == 1 else "s"))
         for p in projects:
             latest = p.get("latest") or {}
             release = latest.get("tag") or latest.get("name") or ""
@@ -1873,18 +2013,13 @@ class App(tk.Tk):
                 release += " (tag)"
             elif latest.get("prerelease"):
                 release += " (pre-release)"
-            if p.get("error"):
-                tag = "error"
-            elif has_update(p):
-                tag = "update"
-            elif not latest:
-                tag = "none"
-            else:
-                tag = ""
+            tag = status_kind(p)
+            tag = "" if tag == "ok" else tag
             checked = (p.get("last_checked") or "")[:16].replace("T", " ")
             self.tree.insert("", "end", iid=project_key(p), tags=(tag,) if tag else (), values=(
                 display_name(p),
-                repo_label(p),
+                repo_path(p),
+                source_label(p),
                 release or "-",
                 (latest.get("published_at") or "")[:10] or "-",
                 status_text(p),
@@ -1954,6 +2089,9 @@ class App(tk.Tk):
         if any(project_key(p) == shown.lower() for p in self.data["projects"]):
             messagebox.showinfo(APP_NAME, "%s is already in the list." % shown)
             return
+        if len(self.data["projects"]) >= MAX_PROJECTS:
+            messagebox.showinfo(APP_NAME, "The list is full (%d projects)." % MAX_PROJECTS)
+            return
         token = self.token()
         self.set_busy(True, "Adding %s ..." % shown)
 
@@ -1997,7 +2135,10 @@ class App(tk.Tk):
         self.data["projects"].append(p)
         self.persist()
         self.entry.delete(0, "end")
-        self.render()
+        if self.filter_active():   # a filtered-out new project would look like it was not added
+            self.clear_filter()
+        else:
+            self.render()
         if latest:
             self.set_status("Added %s - current release %s." % (p["title"], latest["tag"] or latest["name"]))
         else:

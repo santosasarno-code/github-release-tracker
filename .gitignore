@@ -1,7 +1,16 @@
-target/
-dist/
+# Your personal data: NEVER commit these (projects.json can contain your GitHub token in plain text)
 projects.json
 projects.json.bak
 projects.json.tmp
-*.sha256
-*.log
+github_release_tracker_*.json
+
+# Build output
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
