@@ -51,7 +51,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
@@ -297,6 +297,14 @@ class NoReleasesError(GitHubError):
 last_rate_remaining = None
 
 
+def server_down_text(code):
+    """Short, readable text for a 5xx answer (also the 52x codes Cloudflare uses)."""
+    return "Server down (HTTP %d). Try later." % code
+
+
+NOT_FOUND_CHECK = "Not found (deleted or private)."
+
+
 def api_get(path, token=""):
     global last_rate_remaining
     headers = {
@@ -327,6 +335,8 @@ def api_get(path, token=""):
             raise NotFoundError("Not found (wrong name, or a private repository).")
         if e.code == 401:
             raise GitHubError("GitHub rejected the token (401). Check it in Settings.")
+        if e.code >= 500:
+            raise GitHubError(server_down_text(e.code))
         raise GitHubError("GitHub returned HTTP %d." % e.code)
     except urllib.error.URLError as e:
         raise GitHubError("Network error: %s" % e.reason)
@@ -382,7 +392,9 @@ def _newest_release(owner, repo, token):
     try:
         data = api_get("/repos/%s/%s/releases?per_page=10" % (owner, repo), token)
     except NotFoundError:
-        return None
+        # An existing repository without releases answers 200 with an empty list; a 404
+        # here means the repository itself is gone (or private), so do not hide it.
+        raise NotFoundError(NOT_FOUND_CHECK)
     for r in data:
         if not r.get("draft"):
             return _release_dict(r)
@@ -398,7 +410,7 @@ def _newest_tag(owner, repo, token):
     try:
         data = api_get("/repos/%s/%s/tags?per_page=1" % (owner, repo), token)
     except NotFoundError:
-        return None
+        raise NotFoundError(NOT_FOUND_CHECK)
     if not data:
         return None
     t = data[0]
@@ -597,6 +609,8 @@ def http_json(url):
                               "work, and tokens are not supported for this host." % e.code)
         if e.code == 429:
             raise GitHubError("The server is rate-limiting requests (429). Try again later.")
+        if e.code >= 500:
+            raise GitHubError(server_down_text(e.code))
         raise GitHubError("The server returned HTTP %d." % e.code)
     except urllib.error.URLError as e:
         raise NetworkError("Network error: %s" % e.reason)
@@ -717,9 +731,12 @@ def resolve_project(host, kind, segs, include_prereleases=True):
 
 def fetch_latest_for(p_host, p_kind, owner, repo, token, include_prereleases):
     """Latest release for a GitHub project (host "") or one on another host."""
-    if not p_host:
-        return get_latest(owner, repo, token, include_prereleases)
-    return fetch_latest_host(p_host, p_kind, owner, repo, include_prereleases)
+    try:
+        if not p_host:
+            return get_latest(owner, repo, token, include_prereleases)
+        return fetch_latest_host(p_host, p_kind, owner, repo, include_prereleases)
+    except NotFoundError:
+        raise NotFoundError(NOT_FOUND_CHECK)
 
 
 def apply_result(p, latest, err, now):
@@ -897,6 +914,8 @@ def normalize_project(raw):
     custom = clean_name(raw.get("custom_name"))
     if custom:  # only present when the user renamed the project
         out["custom_name"] = custom
+    if raw.get("favorite") is True:  # only present when starred
+        out["favorite"] = True
     return out
 
 
@@ -990,6 +1009,59 @@ def sort_projects(projects, col, asc):
     return sorted(projects, key=lambda p: (not has_update(p), _title_key(p)))
 
 
+# --------------------------------------------------------------------------
+# Window memory: size, position and maximized state, restored on the next start.
+# Size is stored in logical units (100% scaling), position in screen pixels.
+# --------------------------------------------------------------------------
+MAX_COORD = 100000
+
+
+def normalize_window(raw):
+    """A clean {"x","y","w","h","maximized"} dict from untrusted input, or None if unusable."""
+    if not isinstance(raw, dict):
+        return None
+    vals = []
+    for k in ("x", "y", "w", "h"):
+        v = raw.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or abs(v) > MAX_COORD:
+            return None
+        vals.append(v)
+    if vals[2] < 100 or vals[3] < 100:
+        return None
+    return {"x": vals[0], "y": vals[1], "w": vals[2], "h": vals[3],
+            "maximized": raw.get("maximized") is True}
+
+
+def fit_window(win, monitors, min_w, min_h, scale=1.0, bar_h=30, grab_w=100):
+    """Where to open the window, as (x, y, w, h) in pixels; x and y are None for "use the default".
+
+    win: a normalize_window() result. monitors: [(left, top, right, bottom)] work areas.
+    The title bar must overlap a monitor by at least grab_w x bar_h pixels (scaled), otherwise the
+    window could not be grabbed (monitor unplugged, resolution changed): the saved position is
+    dropped and only the size is kept. The size never goes below the minimum or above the
+    monitor the window lands on.
+    """
+    w = max(int(round(win["w"] * scale)), min_w)
+    h = max(int(round(win["h"] * scale)), min_h)
+    if not monitors:
+        return None, None, w, h
+    x, y = win["x"], win["y"]
+    need_w, need_h = int(grab_w * scale), int(bar_h * scale)
+    best = None
+    for (l, t, r, b) in monitors:
+        ow = min(x + w, r) - max(x, l)
+        oh = min(y + need_h, b) - max(y, t)
+        if ow >= min(need_w, w) and oh >= need_h // 2:
+            best = (l, t, r, b)
+            break
+    if best is None:
+        l, t, r, b = monitors[0]
+        return None, None, min(w, max(r - l, min_w)), min(h, max(b - t, min_h))
+    l, t, r, b = best
+    w, h = min(w, max(r - l, min_w)), min(h, max(b - t, min_h))
+    return x, y, w, h
+
+
 def default_data():
     return {"settings": {"token": "", "check_on_launch": False, "theme": "",
                          "sort_col": "", "sort_asc": True}, "projects": []}
@@ -1017,6 +1089,9 @@ def load_data():
         base["settings"]["theme"] = s.get("theme") if s.get("theme") in ("light", "dark") else ""
         base["settings"]["sort_col"] = s.get("sort_col") if s.get("sort_col") in SORTABLE else ""
         base["settings"]["sort_asc"] = s.get("sort_asc") is not False
+        win = normalize_window(s.get("window"))
+        if win:
+            base["settings"]["window"] = win
     projects, _ = parse_import(d)
     base["projects"] = projects or []
     return base
@@ -1068,8 +1143,18 @@ def status_kind(p):
     return "ok"
 
 
+def is_favorite(p):
+    return p.get("favorite") is True
+
+
+def star_name(p):
+    """Project column text: a star in front of favorites. Only for display; never sorted or searched."""
+    return ("\u2605 " if is_favorite(p) else "") + display_name(p)
+
+
 # Choices of the status filter (value, menu text). "all" shows everything.
-STATUS_FILTERS = [("all", "All projects"), ("update", "Updates available"), ("error", "Errors"),
+STATUS_FILTERS = [("all", "All projects"), ("favorite", "\u2605 Favorites"),
+                  ("update", "Updates available"), ("error", "Errors"),
                   ("ok", "Up to date"), ("none", "No releases")]
 
 
@@ -1083,7 +1168,10 @@ def filter_projects(projects, query="", kind="all"):
     terms = (query or "").casefold().split()
     out = []
     for p in projects:
-        if kind != "all" and status_kind(p) != kind:
+        if kind == "favorite":
+            if not is_favorite(p):
+                continue
+        elif kind != "all" and status_kind(p) != kind:
             continue
         if terms:
             hay = ("%s %s %s" % (display_name(p), repo_label(p), source_label(p))).casefold()
@@ -1199,6 +1287,43 @@ class Tooltip:
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
+def monitor_areas(root):
+    """Work areas of all monitors as (left, top, right, bottom); the primary monitor comes first."""
+    areas = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+                                  ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+        def cb(hmon, _hdc, _rect, _lp):
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                item = (r.left, r.top, r.right, r.bottom)
+                if mi.dwFlags & 1:   # MONITORINFOF_PRIMARY
+                    areas.insert(0, item)
+                else:
+                    areas.append(item)
+            return 1
+
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(cb), 0)
+    except Exception:  # noqa: BLE001 - not Windows, or the call failed
+        areas = []
+    if not areas:
+        areas = [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
+    return areas
+
+
+GEOM_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1247,10 +1372,55 @@ class App(tk.Tk):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w = max(min(self.px(1260), sw - 40), min_w)
         h = max(min(self.px(560), sh - self.px(120)), min_h)
-        self.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+        saved = self.data["settings"].get("window")
+        maximized = False
+        if saved:
+            sx, sy, sw_, sh_ = fit_window(saved, monitor_areas(self), min_w, min_h, self.ui_scale)
+            w, h = sw_, sh_
+            if sx is not None:
+                x, y = sx, sy
+            maximized = saved["maximized"]
+        self.geometry("%dx%d%+d%+d" % (w, h, x, y))
+        self._normal_geom = (x, y, w, h)   # last position/size while the window was neither maximized nor minimized
+        self._was_max = maximized
+        if maximized:
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
+        self.bind("<Configure>", self._track_window, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
         if self.data["settings"].get("check_on_launch") and self.data["projects"]:
             self.after(400, self.check_updates)
+
+    def _track_window(self, event):
+        if event.widget is not self:
+            return
+        try:
+            state = self.state()
+            if state == "normal":
+                m = GEOM_RE.match(self.geometry())
+                if m:
+                    w, h, x, y = (int(g) for g in m.groups())
+                    self._normal_geom, self._was_max = (x, y, w, h), False
+            elif state == "zoomed":
+                self._was_max = True
+        except tk.TclError:
+            pass
+
+    def _on_close(self):
+        try:
+            x, y, w, h = self._normal_geom
+            win = normalize_window({"x": x, "y": y, "w": int(round(w / self.ui_scale)),
+                                    "h": int(round(h / self.ui_scale)), "maximized": self._was_max})
+            if win:
+                self.data["settings"]["window"] = win
+                self.persist()
+        except Exception:  # noqa: BLE001 - never block closing
+            pass
+        self.destroy()
 
     # ---- layout ----------------------------------------------------------
     def px(self, n):
@@ -1301,6 +1471,8 @@ class App(tk.Tk):
         for value, text in STATUS_FILTERS:
             self.kind_menu.add_radiobutton(label=text, value=value, variable=self.filter_kind,
                                            command=self._kind_changed)
+            if value == "all":
+                self.kind_menu.add_separator()
         self.kind_button["menu"] = self.kind_menu
         self.kind_button.pack(side="left")
         self.btn_clear = ttk.Button(flt, text="Clear", command=self.clear_filter)
@@ -1372,7 +1544,11 @@ class App(tk.Tk):
         self.pre_var = tk.BooleanVar(value=False)
         self.menu.add_command(label="Open release page", command=self.open_release)
         self.menu.add_command(label="Open repository", command=self.open_repo)
+        self.menu.add_command(label="Check selected", command=self.check_selected)
         self.menu.add_command(label="Mark as seen", command=self.mark_seen)
+        self.menu.add_separator()
+        self.menu.add_command(label="Add to favorites", command=self.toggle_favorite)
+        self.fav_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_command(label="Rename...", accelerator="F2", command=self.rename_selected)
         self.menu.add_command(label="Reset name", command=self.reset_name)
@@ -2017,7 +2193,7 @@ class App(tk.Tk):
             tag = "" if tag == "ok" else tag
             checked = (p.get("last_checked") or "")[:16].replace("T", " ")
             self.tree.insert("", "end", iid=project_key(p), tags=(tag,) if tag else (), values=(
-                display_name(p),
+                star_name(p),
                 repo_path(p),
                 source_label(p),
                 release or "-",
@@ -2066,6 +2242,9 @@ class App(tk.Tk):
             sel = self.selected_projects()
             if sel:
                 self.pre_var.set(bool(sel[0].get("include_prereleases")))
+            self.menu.entryconfigure(self.fav_index,
+                                     label="Remove from favorites" if sel and all(is_favorite(p) for p in sel)
+                                     else "Add to favorites")
             self.menu.entryconfigure("Rename...", state="normal" if len(sel) == 1 else "disabled")
             self.menu.entryconfigure("Reset name", state="normal" if any(p.get("custom_name") for p in sel) else "disabled")
             try:
@@ -2144,28 +2323,33 @@ class App(tk.Tk):
         else:
             self.set_status("Added %s - it has no published releases yet." % p["title"])
 
-    def check_updates(self):
+    def check_selected(self):
+        self.check_updates(only_selected=True)
+
+    def check_updates(self, only_selected=False):
         if self.busy:
             return
-        if not self.data["projects"]:
-            self.set_status("Nothing to check - add a project first.")
+        projects = self.selected_projects() if only_selected else self.data["projects"]
+        if not projects:
+            self.set_status("Select one or more projects first." if only_selected
+                            else "Nothing to check - add a project first.")
             return
         token = self.token()
         snapshot = [(p.get("host") or "", p.get("kind"), p["owner"], p["repo"], bool(p.get("include_prereleases")),
-                     project_key(p)) for p in self.data["projects"]]
+                     project_key(p)) for p in projects]
         self.set_busy(True, "Checking %d project(s) ..." % len(snapshot))
 
         def work():
-            out = []
+            out, limit = [], ""
             for host, kind, owner, repo, inc, key in snapshot:
                 try:
                     out.append((key, fetch_latest_for(host, kind, owner, repo, token, inc), None))
                 except RateLimitError as e:
-                    out.append((key, None, str(e)))
-                    break  # no point continuing
+                    limit = str(e)   # a limit for the whole run, not an error of this project
+                    break            # no point continuing
                 except GitHubError as e:
                     out.append((key, None, str(e)))
-            return out
+            return out, limit, len(snapshot) - len(out)
 
         self.run_async(work, self._checked)
 
@@ -2174,6 +2358,7 @@ class App(tk.Tk):
         if exc:
             self.set_status("Check failed: %s" % exc)
             return
+        result, limit, skipped = result
         now = datetime.now().isoformat(timespec="seconds")
         by_key = {project_key(p): p for p in self.data["projects"]}
         errors = 0
@@ -2186,6 +2371,9 @@ class App(tk.Tk):
                 errors += 1
         self.persist()
         self.render()
+        if limit:   # unchecked projects keep their previous state
+            self.set_status("%s %d project(s) not checked." % (limit, skipped))
+            return
         updates = sum(1 for p in self.data["projects"] if has_update(p))
         msg = "Checked %d project(s): %d update(s) available" % (len(result), updates)
         if errors:
@@ -2223,6 +2411,22 @@ class App(tk.Tk):
         if sel:
             p = sel[0]
             webbrowser.open(safe_url(p.get("html_url"), project_base(p), repo_page(p)))
+
+    def toggle_favorite(self):
+        sel = self.selected_projects()
+        if not sel:
+            self.set_status("Select one or more projects first.")
+            return
+        add = not all(is_favorite(p) for p in sel)
+        for p in sel:
+            if add:
+                p["favorite"] = True
+            else:
+                p.pop("favorite", None)
+        self.persist()
+        self.render()
+        self.set_status("%s %d project(s) %s favorites." % ("Added" if add else "Removed", len(sel),
+                                                           "to" if add else "from"))
 
     def toggle_prerelease(self):
         sel = self.selected_projects()
